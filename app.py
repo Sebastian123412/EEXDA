@@ -1,13 +1,11 @@
-# app.py — DE-LU Day-Ahead Fundamental Forecaster (v1)
-# Motor merit-order pentru piata germana. Sursa de date: Energy-Charts (Fraunhofer ISE),
-# fara token necesar, licenta CC BY 4.0. Preturile combustibililor sunt input manual.
+# app.py — DE-LU Day-Ahead Fundamental Forecaster (v2, cu auto-calibrare)
+# Sursa date: Energy-Charts (Fraunhofer ISE), fara token, CC BY 4.0.
+# NOU: (1) curba empirica data-driven (fara parametri), (2) auto-calibrare structurala
+# cu optimizer, (3) split train/test pentru control de supra-fitting.
 #
-# NOTA DE INVATARE (citeste asta prima data):
-# Pretul DA in Germania ~ costul marginal al ultimei unitati dispecerizate ca sa acopere
-# "residual load"-ul (consum minus regenerabile). Dupa iesirea nuclearului (2023), NIVELUL
-# pretului in orele termice e dat de care combustibil e la margine: lignit -> carbune -> gaz.
-# Cine castiga depinde de clean dark spread (carbune+CO2) vs clean spark spread (gaz+CO2).
-# Forma zilei (valea de la pranz vara, spike-urile de Dunkelflaute iarna) e data de regenerabile.
+# INVATARE: pretul DA ~ costul marginal al ultimei unitati care acopera residual load-ul
+# (consum - regenerabile). Nivelul in orele termice = comutarea lignit->carbune->gaz,
+# decisa de clean dark spread (carbune+CO2) vs clean spark spread (gaz+CO2).
 
 import datetime as dt
 import numpy as np
@@ -20,14 +18,13 @@ st.set_page_config(page_title="DE-LU DA Forecaster", page_icon="⚡", layout="wi
 
 BASE = "https://api.energy-charts.info"
 TZ = "Europe/Berlin"
+EF = {"lignite": 0.36, "coal": 0.34, "gas": 0.20, "oil": 0.28}  # tCO2/MWh_th
 
-# ----------------------------------------------------------------------------------
-# 1) STRAT DE DATE — Energy-Charts (fara cheie)
-# ----------------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
+# 1) DATE — Energy-Charts (fara cheie)
+# ---------------------------------------------------------------------------
 @st.cache_data(ttl=1800, show_spinner=False)
-def ec_public_power(country: str, start: str, end: str) -> pd.DataFrame:
-    """Mix de productie + Load + Residual load, in MW. Rezolutie 15 min pentru DE."""
+def ec_public_power(country, start, end):
     r = requests.get(f"{BASE}/public_power",
                      params={"country": country, "start": start, "end": end}, timeout=45)
     r.raise_for_status()
@@ -39,95 +36,123 @@ def ec_public_power(country: str, start: str, end: str) -> pd.DataFrame:
     return df
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def ec_price(bzn: str, start: str, end: str) -> pd.Series:
-    """Pret DA (EUR/MWh) pentru zona de licitatie."""
-    r = requests.get(f"{BASE}/price",
-                     params={"bzn": bzn, "start": start, "end": end}, timeout=45)
+def ec_price(bzn, start, end):
+    r = requests.get(f"{BASE}/price", params={"bzn": bzn, "start": start, "end": end}, timeout=45)
     r.raise_for_status()
     j = r.json()
     idx = pd.to_datetime(j["unix_seconds"], unit="s", utc=True).tz_convert(TZ)
     return pd.Series(j["price"], index=idx, name="DA").astype(float)
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def ec_forecast(country: str, production_type: str) -> pd.Series:
-    """Forecast Energy-Charts pentru solar / wind_onshore / wind_offshore / load."""
-    try:
-        r = requests.get(f"{BASE}/public_power_forecast",
-                         params={"country": country, "production_type": production_type},
-                         timeout=45)
-        r.raise_for_status()
-        j = r.json()
-        idx = pd.to_datetime(j["unix_seconds"], unit="s", utc=True).tz_convert(TZ)
-        # cheia variaza; luam primul array numeric care nu e timestampul
-        for k, v in j.items():
-            if k not in ("unix_seconds", "deprecated") and isinstance(v, list) and len(v) == len(idx):
-                return pd.Series(v, index=idx, name=production_type).astype(float)
-    except Exception:
-        pass
-    return pd.Series(dtype=float, name=production_type)
-
-def find_col(df: pd.DataFrame, *keywords) -> str | None:
-    """Gaseste o coloana care contine toate cuvintele cheie (case-insensitive)."""
+def find_col(df, *keywords):
     for c in df.columns:
-        low = c.lower()
-        if all(k in low for k in keywords):
+        if all(k in c.lower() for k in keywords):
             return c
     return None
 
-def hourly(s: pd.Series | pd.DataFrame):
-    """Aduce totul pe rezolutie orara (medie), ca sa aliniem MW cu preturile."""
+def hourly(s):
     return s.resample("1h").mean()
 
-# ----------------------------------------------------------------------------------
-# 2) MOTOR MERIT-ORDER
-# ----------------------------------------------------------------------------------
-# SRMC (Short Run Marginal Cost, EUR/MWh_el) =
-#   pret_combustibil_termic/randament + pret_CO2 * factor_emisie/randament + VOM
-# factor_emisie: tCO2 / MWh_termic. randament: fractie (electric/termic).
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_market(days_back):
+    end = dt.date.today() + dt.timedelta(days=1)
+    start = end - dt.timedelta(days=days_back)
+    pp = ec_public_power("de", start.isoformat(), end.isoformat())
+    da = ec_price("DE-LU", start.isoformat(), end.isoformat())
+    return pp, da
 
-def srmc(fuel_th: float, co2: float, ef: float, eff: float, vom: float) -> float:
+# ---------------------------------------------------------------------------
+# 2) MODEL STRUCTURAL (merit order)
+# ---------------------------------------------------------------------------
+def srmc(fuel_th, co2, ef, eff, vom):
     return fuel_th / eff + co2 * ef / eff + vom
 
-def build_stack(p: dict) -> list[dict]:
-    """Construieste stiva de unitati dispecerizabile, sortata dupa cost marginal."""
-    coal_eur_per_t = p["coal_usd_t"] / p["eur_usd"]          # $/t -> EUR/t
-    coal_th = coal_eur_per_t / p["coal_mwh_t"]               # EUR/t -> EUR/MWh_th
-
+def build_stack(p):
+    coal_th = (p["coal_usd_t"] / p["eur_usd"]) / p["coal_mwh_t"]
     layers = [
-        {"tech": "Must-run (biomasa+hidro RoR)", "srmc": p["mustrun_cost"], "cap": p["cap_mustrun"]},
-        {"tech": "Lignit",  "srmc": srmc(p["lignite_th"], p["co2"], p["ef_lignite"], p["eff_lignite"], p["vom_lignite"]), "cap": p["cap_lignite"]},
-        {"tech": "Carbune", "srmc": srmc(coal_th,        p["co2"], p["ef_coal"],    p["eff_coal"],    p["vom_coal"]),    "cap": p["cap_coal"]},
-        {"tech": "Gaz CCGT","srmc": srmc(p["ttf"],       p["co2"], p["ef_gas"],     p["eff_ccgt"],    p["vom_gas"]),     "cap": p["cap_ccgt"]},
-        {"tech": "Gaz OCGT","srmc": srmc(p["ttf"],       p["co2"], p["ef_gas"],     p["eff_ocgt"],    p["vom_gas"]),     "cap": p["cap_ocgt"]},
-        {"tech": "Pacura",  "srmc": srmc(p["oil_th"],    p["co2"], p["ef_oil"],     p["eff_oil"],     p["vom_oil"]),     "cap": p["cap_oil"]},
+        {"tech": "Must-run", "srmc": p["mustrun_cost"], "cap": p["cap_mustrun"]},
+        {"tech": "Lignit",  "srmc": srmc(p["lignite_th"], p["co2"], EF["lignite"], p["eff_lignite"], p["vom_lignite"]), "cap": p["cap_lignite"]},
+        {"tech": "Carbune", "srmc": srmc(coal_th,        p["co2"], EF["coal"],    p["eff_coal"],    p["vom_coal"]),    "cap": p["cap_coal"]},
+        {"tech": "Gaz CCGT","srmc": srmc(p["ttf"],       p["co2"], EF["gas"],     p["eff_ccgt"],    p["vom_gas"]),     "cap": p["cap_ccgt"]},
+        {"tech": "Gaz OCGT","srmc": srmc(p["ttf"],       p["co2"], EF["gas"],     p["eff_ocgt"],    p["vom_gas"]),     "cap": p["cap_ocgt"]},
+        {"tech": "Pacura",  "srmc": srmc(p["oil_th"],    p["co2"], EF["oil"],     p["eff_oil"],     p["vom_oil"]),     "cap": p["cap_oil"]},
     ]
     layers.sort(key=lambda x: x["srmc"])
     cum = 0.0
     for L in layers:
-        cum += L["cap"]
-        L["cum"] = cum
+        cum += L["cap"]; L["cum"] = cum
     return layers
 
-def marginal_price(rl_mw: float, stack: list[dict], floor: float, scarcity: float) -> float:
-    """Pretul = SRMC-ul tehnologiei a carei capacitate cumulata acopera residual load-ul."""
-    if rl_mw <= 0:
-        return floor
-    for L in stack:
-        if rl_mw <= L["cum"]:
-            return L["srmc"]
-    return scarcity  # RL depaseste toata capacitatea dispecerizabila -> scarcity
+def marginal_price_vec(rl_arr, stack, floor, scarcity):
+    """Vectorizat: pentru fiecare RL, SRMC-ul primei tehnologii cu cumulat >= RL."""
+    rl_arr = np.asarray(rl_arr, dtype=float)
+    cums = np.array([L["cum"] for L in stack])
+    srmcs = np.array([L["srmc"] for L in stack])
+    idx = np.searchsorted(cums, rl_arr, side="left")
+    over = idx >= len(srmcs)
+    idx_c = np.clip(idx, 0, len(srmcs) - 1)
+    out = np.where(over, scarcity, srmcs[idx_c])
+    out = np.where(rl_arr <= 0, floor, out)
+    return out
 
-def clean_spreads(power: float, p: dict):
-    """Clean spark (gaz) si clean dark (carbune) — arata ce tehnologie e la margine."""
+def clean_spreads(p):
     coal_th = (p["coal_usd_t"] / p["eur_usd"]) / p["coal_mwh_t"]
-    spark = power - srmc(p["ttf"],  p["co2"], p["ef_gas"],  p["eff_ccgt"], 0)
-    dark  = power - srmc(coal_th,   p["co2"], p["ef_coal"], p["eff_coal"], 0)
-    return spark, dark
+    srmc_ccgt = srmc(p["ttf"],  p["co2"], EF["gas"],  p["eff_ccgt"], p["vom_gas"])
+    srmc_coal = srmc(coal_th,   p["co2"], EF["coal"], p["eff_coal"], p["vom_coal"])
+    return srmc_ccgt, srmc_coal
 
-# ----------------------------------------------------------------------------------
-# 3) SIDEBAR — input-uri combustibili si parc
-# ----------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 3) MODEL EMPIRIC (data-driven, fara parametri)
+# ---------------------------------------------------------------------------
+def fit_empirical(rl, da, n_bins=25):
+    d = pd.DataFrame({"rl": np.asarray(rl), "da": np.asarray(da)}).dropna().sort_values("rl")
+    if len(d) < 10:
+        return None
+    try:
+        d["bin"] = pd.qcut(d["rl"], q=min(n_bins, d["rl"].nunique()), duplicates="drop")
+    except Exception:
+        d["bin"] = pd.cut(d["rl"], bins=min(n_bins, 10))
+    g = d.groupby("bin", observed=True).agg(rl=("rl", "median"), da=("da", "median")).dropna()
+    if len(g) < 2:
+        return None
+    xs = g["rl"].values
+    ys = np.maximum.accumulate(g["da"].values)  # monotonic crescator (merit order)
+    return xs, ys
 
+def predict_empirical(rl_new, model):
+    xs, ys = model
+    return np.interp(np.asarray(rl_new, dtype=float), xs, ys)
+
+# ---------------------------------------------------------------------------
+# 4) AUTO-CALIBRARE STRUCTURALA
+# ---------------------------------------------------------------------------
+def autocalibrate(rl_train, da_train, baseP):
+    from scipy.optimize import differential_evolution
+    rl = np.asarray(rl_train, dtype=float); da = np.asarray(da_train, dtype=float)
+    # parametri liberi: eff_lignite, eff_coal, eff_ccgt, cap_mustrun, scarcity, floor
+    bounds = [(0.30, 0.46), (0.35, 0.50), (0.45, 0.62), (0.0, 20000.0), (150.0, 1500.0), (-100.0, 10.0)]
+    def obj(x):
+        p = dict(baseP)
+        p["eff_lignite"], p["eff_coal"], p["eff_ccgt"], p["cap_mustrun"] = x[0], x[1], x[2], x[3]
+        stk = build_stack(p)
+        pred = marginal_price_vec(rl, stk, x[5], x[4])
+        return float(np.mean(np.abs(pred - da)))
+    res = differential_evolution(obj, bounds, seed=42, maxiter=40, popsize=12,
+                                 tol=1e-3, polish=True)
+    return res.x, res.fun
+
+def metrics(pred, actual):
+    pred = np.asarray(pred, dtype=float); actual = np.asarray(actual, dtype=float)
+    m = ~(np.isnan(pred) | np.isnan(actual))
+    pred, actual = pred[m], actual[m]
+    if len(pred) == 0:
+        return dict(mae=np.nan, bias=np.nan, corr=np.nan)
+    return dict(mae=np.mean(np.abs(pred - actual)),
+                bias=np.mean(pred - actual),
+                corr=np.corrcoef(pred, actual)[0, 1] if len(pred) > 1 else np.nan)
+
+# ---------------------------------------------------------------------------
+# 5) SIDEBAR
+# ---------------------------------------------------------------------------
 st.sidebar.title("⚡ DE-LU DA Forecaster")
 page = st.sidebar.radio("Sectiune", ["📊 Piata", "⚙️ Motor merit-order", "🎯 Forecast vs DA", "📚 Teorie"])
 
@@ -135,14 +160,12 @@ st.sidebar.header("Combustibili & CO2")
 ttf        = st.sidebar.number_input("Gaz TTF (EUR/MWh_th)", 5.0, 200.0, 32.0, 0.5)
 coal_usd_t = st.sidebar.number_input("Carbune API2 ($/t)", 40.0, 400.0, 110.0, 1.0)
 eur_usd    = st.sidebar.number_input("EUR/USD", 0.90, 1.30, 1.08, 0.01)
-coal_mwh_t = st.sidebar.number_input("Continut energetic carbune (MWh_th/t)", 5.0, 9.0, 6.978, 0.05,
-                                     help="API2 6000 kcal/kg NAR ≈ 6.978 MWh/t. Ajusteaza dupa specificatie.")
+coal_mwh_t = st.sidebar.number_input("Continut energetic carbune (MWh_th/t)", 5.0, 9.0, 6.978, 0.05)
 co2        = st.sidebar.number_input("CO2 EUA (EUR/t)", 20.0, 200.0, 75.0, 1.0)
-lignite_th = st.sidebar.number_input("Cost lignit (EUR/MWh_th)", 2.0, 20.0, 6.0, 0.5,
-                                     help="Lignitul e local, cost ~ minerit; nu are piata lichida.")
+lignite_th = st.sidebar.number_input("Cost lignit (EUR/MWh_th)", 2.0, 20.0, 6.0, 0.5)
 oil_th     = st.sidebar.number_input("Cost pacura (EUR/MWh_th)", 20.0, 120.0, 55.0, 1.0)
 
-with st.sidebar.expander("Randamente (η) & VOM"):
+with st.sidebar.expander("Randamente & VOM (start manual)"):
     eff_lignite = st.slider("η Lignit", 0.30, 0.46, 0.38, 0.01)
     eff_coal    = st.slider("η Carbune", 0.35, 0.50, 0.44, 0.01)
     eff_ccgt    = st.slider("η Gaz CCGT", 0.45, 0.62, 0.55, 0.01)
@@ -153,7 +176,7 @@ with st.sidebar.expander("Randamente (η) & VOM"):
     vom_gas     = st.number_input("VOM gaz", 0.0, 10.0, 2.0, 0.5)
     vom_oil     = st.number_input("VOM pacura", 0.0, 10.0, 3.0, 0.5)
 
-with st.sidebar.expander("Capacitati disponibile (MW)"):
+with st.sidebar.expander("Capacitati (MW)"):
     cap_mustrun = st.number_input("Must-run", 0, 20000, 8000, 500)
     cap_lignite = st.number_input("Lignit", 0, 30000, 14000, 500)
     cap_coal    = st.number_input("Carbune", 0, 30000, 13000, 500)
@@ -161,189 +184,158 @@ with st.sidebar.expander("Capacitati disponibile (MW)"):
     cap_ocgt    = st.number_input("Gaz OCGT", 0, 30000, 12000, 500)
     cap_oil     = st.number_input("Pacura", 0, 10000, 4000, 500)
 
-with st.sidebar.expander("Preturi de plafon"):
-    floor    = st.number_input("Plafon jos / regenerabil (EUR/MWh)", -500.0, 20.0, -5.0, 5.0)
-    scarcity = st.number_input("Pret scarcity (EUR/MWh)", 200.0, 4000.0, 500.0, 50.0)
-
-# Factori de emisie ficsi (tCO2/MWh_th) — valori standard
-EF = {"lignite": 0.36, "coal": 0.34, "gas": 0.20, "oil": 0.28}
+floor    = st.sidebar.number_input("Plafon jos (EUR/MWh)", -500.0, 20.0, -5.0, 5.0)
+scarcity = st.sidebar.number_input("Pret scarcity (EUR/MWh)", 200.0, 4000.0, 500.0, 50.0)
 
 P = dict(ttf=ttf, coal_usd_t=coal_usd_t, eur_usd=eur_usd, coal_mwh_t=coal_mwh_t, co2=co2,
-         lignite_th=lignite_th, oil_th=oil_th,
+         lignite_th=lignite_th, oil_th=oil_th, mustrun_cost=1.0,
          eff_lignite=eff_lignite, eff_coal=eff_coal, eff_ccgt=eff_ccgt, eff_ocgt=eff_ocgt, eff_oil=eff_oil,
          vom_lignite=vom_lignite, vom_coal=vom_coal, vom_gas=vom_gas, vom_oil=vom_oil,
-         ef_lignite=EF["lignite"], ef_coal=EF["coal"], ef_gas=EF["gas"], ef_oil=EF["oil"],
          cap_mustrun=cap_mustrun, cap_lignite=cap_lignite, cap_coal=cap_coal,
-         cap_ccgt=cap_ccgt, cap_ocgt=cap_ocgt, cap_oil=cap_oil, mustrun_cost=1.0)
+         cap_ccgt=cap_ccgt, cap_ocgt=cap_ocgt, cap_oil=cap_oil)
 
-stack = build_stack(P)
+stack_manual = build_stack(P)
 
-# ----------------------------------------------------------------------------------
-# 4) PAGINI
-# ----------------------------------------------------------------------------------
-
-def load_market(days_back: int):
-    end = dt.date.today() + dt.timedelta(days=1)
-    start = end - dt.timedelta(days=days_back)
-    s, e = start.isoformat(), end.isoformat()
-    pp = ec_public_power("de", s, e)
-    da = ec_price("DE-LU", s, e)
-    return pp, da
-
-# ===== PAGINA: PIATA =====
+# ---------------------------------------------------------------------------
+# 6) PAGINI
+# ---------------------------------------------------------------------------
 if page == "📊 Piata":
     st.title("📊 Piata DE-LU — date reale")
-    days = st.selectbox("Interval (zile in urma)", [3, 7, 14, 30], index=1)
+    days = st.selectbox("Interval (zile)", [3, 7, 14, 30], index=1)
     try:
         pp, da = load_market(days)
     except Exception as ex:
-        st.error(f"Eroare la incarcarea datelor: {ex}")
-        st.stop()
-
-    c_load  = find_col(pp, "load") if not find_col(pp, "residual") else find_col(pp, "load")
-    c_load  = find_col(pp, "load")
-    c_res   = find_col(pp, "residual")
-    c_won   = find_col(pp, "wind", "onshore")
-    c_woff  = find_col(pp, "wind", "offshore")
-    c_sol   = find_col(pp, "solar")
-
-    pph = hourly(pp)
-    dah = hourly(da)
-
+        st.error(f"Eroare: {ex}"); st.stop()
+    c_res = find_col(pp, "residual"); c_sol = find_col(pp, "solar")
+    c_won = find_col(pp, "wind", "onshore"); c_woff = find_col(pp, "wind", "offshore")
+    pph, dah = hourly(pp), hourly(da)
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("DA mediu (EUR/MWh)", f"{dah.mean():.1f}")
-    k1.metric("DA min / max", f"{dah.min():.0f} / {dah.max():.0f}")
-    if c_res:  k2.metric("Residual load mediu (MW)", f"{pph[c_res].mean():,.0f}")
-    neg = (dah < 0).sum()
-    k3.metric("Ore cu pret negativ", f"{int(neg)}")
-    if c_sol:  k4.metric("Solar peak (MW)", f"{pph[c_sol].max():,.0f}")
-
-    st.subheader("Pret DA")
-    st.line_chart(dah)
-
-    st.subheader("Residual load vs regenerabile")
+    k1.metric("DA mediu", f"{dah.mean():.1f}")
+    if c_res: k2.metric("Residual load mediu (MW)", f"{pph[c_res].mean():,.0f}")
+    k3.metric("Ore pret negativ", f"{int((dah < 0).sum())}")
+    if c_sol: k4.metric("Solar peak (MW)", f"{pph[c_sol].max():,.0f}")
+    st.subheader("Pret DA"); st.line_chart(dah)
     cols = [c for c in [c_res, c_won, c_woff, c_sol] if c]
     if cols:
-        st.line_chart(pph[cols])
-
-    st.subheader("Pret DA vs Residual load (scatter)")
+        st.subheader("Residual load vs regenerabile"); st.line_chart(pph[cols])
     if c_res:
+        st.subheader("DA vs Residual load (norul = merit order empiric)")
         j = pd.concat([dah.rename("DA"), pph[c_res].rename("RL")], axis=1).dropna()
-        fig = go.Figure(go.Scatter(x=j["RL"], y=j["DA"], mode="markers",
-                                   marker=dict(size=5, opacity=0.5)))
+        fig = go.Figure(go.Scatter(x=j["RL"], y=j["DA"], mode="markers", marker=dict(size=5, opacity=0.5)))
         fig.update_layout(xaxis_title="Residual load (MW)", yaxis_title="DA (EUR/MWh)", height=420)
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("Norul asta ESTE merit order-ul empiric. Panta = cat de scump devine sistemul "
-                   "cand creste RL. Imprastierea verticala = variatia combustibililor/outage-urilor.")
 
-# ===== PAGINA: MOTOR MERIT-ORDER =====
 elif page == "⚙️ Motor merit-order":
     st.title("⚙️ Motor merit-order")
-    st.markdown("Stiva de unitati sortata dupa cost marginal. Rasuceste butoanele din sidebar "
-                "si uita-te cum se reordoneaza si cum se misca curba pret(RL).")
-
-    dfstack = pd.DataFrame(stack)
-    dfstack = dfstack.rename(columns={"tech": "Tehnologie", "srmc": "SRMC (EUR/MWh)",
-                                      "cap": "Capacitate (MW)", "cum": "Cumulat (MW)"})
-    dfstack["SRMC (EUR/MWh)"] = dfstack["SRMC (EUR/MWh)"].round(1)
-    st.dataframe(dfstack, use_container_width=True, hide_index=True)
-
-    # Fuel switching: la ce pret de energie gazul intra sub carbune?
-    coal_th = (P["coal_usd_t"] / P["eur_usd"]) / P["coal_mwh_t"]
-    srmc_ccgt = srmc(P["ttf"], P["co2"], EF["gas"], P["eff_ccgt"], P["vom_gas"])
-    srmc_coal = srmc(coal_th, P["co2"], EF["coal"], P["eff_coal"], P["vom_coal"])
-    marginal_tech = "GAZ (CCGT)" if srmc_ccgt < srmc_coal else "CARBUNE"
-
+    df = pd.DataFrame(stack_manual).rename(columns={"tech": "Tehnologie", "srmc": "SRMC",
+                                                    "cap": "Capacitate MW", "cum": "Cumulat MW"})
+    df["SRMC"] = df["SRMC"].round(1)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    srmc_ccgt, srmc_coal = clean_spreads(P)
     c1, c2, c3 = st.columns(3)
     c1.metric("SRMC Gaz CCGT", f"{srmc_ccgt:.1f}")
     c2.metric("SRMC Carbune", f"{srmc_coal:.1f}")
-    c3.metric("La margine (termic)", marginal_tech)
-
-    st.subheader("Curba de oferta preț(residual load)")
-    rl_grid = np.arange(0, sum(L["cap"] for L in stack) + 5000, 250)
-    prices = [marginal_price(rl, stack, floor, scarcity) for rl in rl_grid]
+    c3.metric("La margine", "GAZ" if srmc_ccgt < srmc_coal else "CARBUNE")
+    if "fit" in st.session_state:
+        f = st.session_state["fit"]
+        st.success(f"Parametri auto-calibrati: η_lignit={f[0]:.3f}, η_carbune={f[1]:.3f}, "
+                   f"η_CCGT={f[2]:.3f}, must-run={f[3]:,.0f} MW, scarcity={f[4]:.0f}, floor={f[5]:.0f}")
+    st.subheader("Curba de oferta preț(RL)")
+    rl_grid = np.arange(0, sum(L["cap"] for L in stack_manual) + 5000, 250)
+    prices = marginal_price_vec(rl_grid, stack_manual, floor, scarcity)
     fig = go.Figure(go.Scatter(x=rl_grid, y=prices, mode="lines", line_shape="hv"))
-    fig.update_layout(xaxis_title="Residual load (MW)", yaxis_title="Pret marginal (EUR/MWh)", height=420)
+    fig.update_layout(xaxis_title="Residual load (MW)", yaxis_title="Pret marginal", height=420)
     st.plotly_chart(fig, use_container_width=True)
-    st.caption("Aceasta e curba pe care o compari cu norul empiric din pagina Piata. "
-               "Daca norul real sta mai sus/jos decat curba ta, ori combustibilii, ori "
-               "capacitatile, ori randamentele tale sunt gresite — asta e feedback-ul de calibrare.")
 
-# ===== PAGINA: FORECAST VS DA =====
 elif page == "🎯 Forecast vs DA":
-    st.title("🎯 Preț fundamental vs DA realizat")
-    days = st.selectbox("Interval de backtest (zile)", [7, 14, 30], index=1)
+    st.title("🎯 Forecast vs DA — 3 modele comparate")
+    days = st.selectbox("Interval (zile)", [14, 30, 60], index=1)
     try:
         pp, da = load_market(days)
     except Exception as ex:
-        st.error(f"Eroare: {ex}")
-        st.stop()
-
+        st.error(f"Eroare: {ex}"); st.stop()
     c_res = find_col(pp, "residual")
     if not c_res:
-        st.warning("Nu am gasit coloana 'Residual load' in raspuns.")
-        st.stop()
+        st.warning("Lipseste 'Residual load'."); st.stop()
 
-    pph = hourly(pp)
-    dah = hourly(da)
-    rl = pph[c_res]
-    fund = rl.apply(lambda x: marginal_price(x, stack, floor, scarcity)).rename("Fundamental")
+    d = pd.concat([hourly(da).rename("DA"), hourly(pp)[c_res].rename("RL")], axis=1).dropna()
+    n = len(d); split = int(n * 0.7)
+    train, test = d.iloc[:split], d.iloc[split:]
+    st.caption(f"{n} ore | train: primele {split} | test: ultimele {n - split} "
+               f"(split temporal — testul e 'viitorul' pe care modelul nu l-a vazut)")
 
-    j = pd.concat([dah.rename("DA"), fund], axis=1).dropna()
-    err = j["Fundamental"] - j["DA"]
-    mae = err.abs().mean()
-    bias = err.mean()
-    corr = j["DA"].corr(j["Fundamental"])
+    # --- Model 1: structural manual ---
+    pred_manual = marginal_price_vec(test["RL"], stack_manual, floor, scarcity)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("MAE (EUR/MWh)", f"{mae:.1f}")
-    c2.metric("Bias (fund - DA)", f"{bias:+.1f}")
-    c3.metric("Corelatie", f"{corr:.2f}")
+    # --- Model 2: structural auto-calibrat ---
+    st.subheader("Auto-calibrare structurala")
+    if st.button("🔧 Calibreaza automat pe train"):
+        with st.spinner("Optimizer ruleaza..."):
+            x, fun = autocalibrate(train["RL"], train["DA"], P)
+            st.session_state["fit"] = x
+            st.success(f"Gata. MAE train = {fun:.1f} EUR/MWh")
+    pred_auto = None
+    if "fit" in st.session_state:
+        f = st.session_state["fit"]
+        pauto = dict(P); pauto["eff_lignite"], pauto["eff_coal"], pauto["eff_ccgt"], pauto["cap_mustrun"] = f[0], f[1], f[2], f[3]
+        stk_auto = build_stack(pauto)
+        pred_auto = marginal_price_vec(test["RL"], stk_auto, f[5], f[4])
 
-    st.subheader("Serie: DA realizat vs Fundamental")
-    st.line_chart(j)
+    # --- Model 3: empiric ---
+    emp = fit_empirical(train["RL"], train["DA"])
+    pred_emp = predict_empirical(test["RL"], emp) if emp else None
 
-    st.subheader("Scatter fundamental vs DA")
+    # --- Tabel de scoruri (pe test) ---
+    rows = [("Structural manual", metrics(pred_manual, test["DA"]))]
+    if pred_auto is not None: rows.append(("Structural auto", metrics(pred_auto, test["DA"])))
+    if pred_emp is not None:  rows.append(("Empiric", metrics(pred_emp, test["DA"])))
+    tbl = pd.DataFrame([{"Model": nm, "MAE test": f"{m['mae']:.1f}",
+                         "Bias test": f"{m['bias']:+.1f}", "Corr test": f"{m['corr']:.2f}"}
+                        for nm, m in rows])
+    st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+    # --- Scatter + curbe ---
+    st.subheader("Norul DA vs RL + curbele modelelor")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=j["DA"], y=j["Fundamental"], mode="markers", marker=dict(size=5, opacity=0.5)))
-    lim = [min(j.min().min(), 0), j.max().max()]
-    fig.add_trace(go.Scatter(x=lim, y=lim, mode="lines", line=dict(dash="dash"), name="perfect"))
-    fig.update_layout(xaxis_title="DA realizat", yaxis_title="Fundamental", height=420, showlegend=False)
+    fig.add_trace(go.Scatter(x=d["RL"], y=d["DA"], mode="markers",
+                             marker=dict(size=4, opacity=0.35), name="DA real"))
+    rl_grid = np.linspace(d["RL"].min(), d["RL"].max(), 200)
+    fig.add_trace(go.Scatter(x=rl_grid, y=marginal_price_vec(rl_grid, stack_manual, floor, scarcity),
+                             mode="lines", name="Structural manual", line_shape="hv"))
+    if pred_auto is not None:
+        fig.add_trace(go.Scatter(x=rl_grid, y=marginal_price_vec(rl_grid, stk_auto, f[5], f[4]),
+                                 mode="lines", name="Structural auto", line_shape="hv"))
+    if emp:
+        fig.add_trace(go.Scatter(x=rl_grid, y=predict_empirical(rl_grid, emp),
+                                 mode="lines", name="Empiric", line=dict(width=3)))
+    fig.update_layout(xaxis_title="Residual load (MW)", yaxis_title="EUR/MWh", height=460)
     st.plotly_chart(fig, use_container_width=True)
+    st.info("Compara MAE test intre modele. Empiricul e de obicei greu de batut fara efort. "
+            "Daca structural-auto se apropie de empiric, ai un model interpretabil (iti da "
+            "tehnologia marginala si clean spreads) la fel de bun ca cel data-driven — "
+            "asta e combinatia castigatoare.")
 
-    st.info("**Interpretare:** un bias pozitiv constant = modelul tau supraestimeaza "
-            "(probabil combustibili/CO2 prea scumpi sau capacitati prea mici). "
-            "MAE mare doar in orele de varf = problema de coada (scarcity/peakere). "
-            "MAE mare la pranz = problema pe zona negativa/solar. Aici incepe calibrarea.")
-
-# ===== PAGINA: TEORIE =====
 else:
-    st.title("📚 Teorie — cum se formeaza prețul DA in DE-LU")
+    st.title("📚 Teorie")
     st.markdown(r"""
-### 1. Ecuatia de baza
-**Residual Load (RL) = Consum − Eolian − Solar − must-run.**
-Pretul DA ≈ costul marginal al ultimei unitati care acopera RL, ajustat de cuplajul cross-border (flow-based Core).
+### De ce NU calibrezi manual
+Modelul structural are prea multi parametri corelati (randamente × capacitati × combustibili).
+Ochiul nu poate optimiza 13 variabile simultan. Doua solutii corecte:
+- **Empiric**: lasi datele sa deseneze curba preț(RL) — median per bin, monoton crescator. Fara parametri.
+- **Auto-calibrare**: un optimizer (least-squares / differential evolution) gaseste parametrii care minimizeaza eroarea pe train.
 
-### 2. Cine e la margine (post-nuclear)
-Merit order: **regenerabile (~0) → lignit → carbune → gaz CCGT → gaz OCGT → pacura/scarcity.**
-- **Clean dark spread** = Pret − (carbune/η + CO2·EF/η) → profitul carbunelui.
-- **Clean spark spread** = Pret − (gaz/η + CO2·EF/η) → profitul gazului.
-- Cand gazul e ieftin fata de carbune+CO2, CCGT intra sub carbune si "taie" nivelul.
+### Train / test (anti supra-fitting)
+Antrenezi pe primele 70% din ore, masori pe ultimele 30% pe care modelul NU le-a vazut.
+Daca MAE-train e mic dar MAE-test e mare → ai memorat zgomot, nu ai invatat structura.
 
-### 3. Doua regimuri
-- **Regenerabil abundent** → RL mic → pret se prabuseste, adesea negativ (regula EEG suspenda subventia in orele negative → schimba biddarea).
-- **Dunkelflaute** (vant slab + soare putin, iarna) → RL mare → peakere → spike-uri.
+### Ecuatia
+RL = Consum − Eolian − Solar − must-run. Pret DA ≈ SRMC-ul ultimei unitati care acopera RL.
+Nivelul termic = comutarea lignit → carbune → gaz, decisa de clean dark vs clean spark spread.
 
-### 4. Unde e alpha
-Banii NU vin din a avea dreptate in absolut, ci din a avea **mai multa** dreptate decat consensul.
-Backtesteaza mereu *forecast-ul tau vs. curba/settlement de la momentul deciziei*, nu vs. realizat.
-Edge-ul e cel mai ascutit pe scadentele front (Day/Weekend/Week), unde vizibilitatea meteo e buna.
-
-### 5. Descompunerea erorii (cel mai profitabil exercitiu la inceput)
-Cat din eroarea ta DA vine din: eroare de consum? de vant? de solar? de cross-border? de combustibil?
-Iti spune unde sa investesti efort. Fara asta, calibrezi orbeste.
+### Unde e alpha
+Nu conteaza sa ai dreptate in absolut, ci **mai mult** decat consensul. Backtesteaza forecast-ul
+tau vs. curba/settlement de la momentul deciziei. Edge maxim pe front (Day/Week).
 """)
-    st.caption("Sursa date live: Energy-Charts / Fraunhofer ISE (CC BY 4.0).")
 
 st.sidebar.divider()
-st.sidebar.caption("Date: Energy-Charts (Fraunhofer ISE), CC BY 4.0. Preturi combustibili: input manual.")
+st.sidebar.caption("Date: Energy-Charts (Fraunhofer ISE), CC BY 4.0.")
