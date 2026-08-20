@@ -19,6 +19,10 @@ TZ = "Europe/Berlin"
 ENTSOE = "https://web-api.tp.entsoe.eu/api"
 DE_LU = "10Y1001A1001A82H"
 
+COMPONENTS = ["Vant onshore", "Vant offshore", "Solar", "Hidro ROR"]
+COLS = ["Consum", "Vant onshore", "Vant offshore", "Vant total",
+        "Solar", "Hidro ROR", "RL"]
+
 
 # ---------------------------------------------------------------------------
 # ENTSO-E
@@ -84,7 +88,13 @@ def _call(params):
 
 @st.cache_data(ttl=1800, show_spinner="Preiau date ENTSO-E...")
 def get_data(s_utc, e_utc):
-    """Consum (A65) + vant/solar/hidro-ror (A69), ambele processType A01."""
+    """
+    Consum (A65) + vant/solar/hidro-ror (A69), ambele processType A01.
+
+    Returneaza si `missing`: numarul de ore in care o componenta lipsea din A69
+    si a fost completata cu 0. Fara asta nu poti distinge "n-a produs" de
+    "nu s-a publicat" — iar diferenta se vede direct in RL.
+    """
     load = _call({"documentType": "A65", "processType": "A01",
                   "outBiddingZone_Domain": DE_LU,
                   "periodStart": s_utc, "periodEnd": e_utc}).get("ALL")
@@ -93,19 +103,29 @@ def get_data(s_utc, e_utc):
                  "periodStart": s_utc, "periodEnd": e_utc})
 
     if load is None or len(load) == 0:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.Series(dtype=int)
 
     df = pd.DataFrame({"Consum": load.tz_convert(TZ)}).resample("1h").mean()
+
     for psr, name in [("B19", "Vant onshore"), ("B18", "Vant offshore"),
                       ("B16", "Solar"), ("B11", "Hidro ROR")]:
         if psr in ren:
             df[name] = ren[psr].tz_convert(TZ).resample("1h").mean()
         else:
-            df[name] = 0.0
+            df[name] = float("nan")
+
+    # Cate ore au fost completate artificial, inainte de fillna.
+    missing = df[COMPONENTS].isna().sum()
+
+    # Orele lipsa din A69 (gauri de publicare, reindexare pe grila de consum)
+    # ar propaga NaN in RL. Le tratam ca productie 0 — vezi avertismentul de mai jos.
+    df["_gaps"] = df[COMPONENTS].isna().any(axis=1).astype(int)
+    df[COMPONENTS] = df[COMPONENTS].fillna(0.0)
 
     df["Vant total"] = df["Vant onshore"] + df["Vant offshore"]
-    df["RL"] = (df["Consum"] - df["Vant total"] - df["Solar"] - df["Hidro ROR"])
-    return df.dropna(subset=["Consum"])
+    df["RL"] = df["Consum"] - df["Vant total"] - df["Solar"] - df["Hidro ROR"]
+
+    return df.dropna(subset=["Consum"]), missing
 
 
 # ---------------------------------------------------------------------------
@@ -119,15 +139,13 @@ end = dt.date.today() + dt.timedelta(days=2)          # include si maine
 s_utc = pd.Timestamp(start, tz=TZ).tz_convert("UTC").strftime("%Y%m%d%H%M")
 e_utc = pd.Timestamp(end, tz=TZ).tz_convert("UTC").strftime("%Y%m%d%H%M")
 
-df = get_data(s_utc, e_utc)
+df, missing = get_data(s_utc, e_utc)
 if df.empty:
     st.error("Nu am primit date. Verifica ENTSOE_TOKEN in secrets.")
     st.stop()
 
 k = 1000.0 if unit == "GW" else 1.0
-fmt = "%.2f" if unit == "GW" else "%.0f"
-COLS = ["Consum", "Vant onshore", "Vant offshore", "Vant total",
-        "Solar", "Hidro ROR", "RL"]
+nd = 2 if unit == "GW" else 0
 
 st.caption(
     f"{len(df)} ore, {df.index.min():%Y-%m-%d %H:%M} → {df.index.max():%Y-%m-%d %H:%M} (CET). "
@@ -135,11 +153,23 @@ st.caption(
     "A69 nu o publica. E un offset constant, nu compara nivelul cu seria `rdl` de la Volue."
 )
 
+if missing.sum() > 0:
+    st.warning(
+        "Ore completate cu 0 pentru ca A69 nu le-a publicat: "
+        + ", ".join(f"{n} ({int(v)}h)" for n, v in missing.items() if v > 0)
+        + ". Atentie: 0 inseamna aici *nu s-a publicat*, nu *n-a produs*. "
+        "O ora fara vant iti umfla RL-ul cu pana la 10 GW si arata perfect normal in tabel. "
+        "Pentru vizualizare e acceptabil; inainte sa fitezi ceva pe datele astea, exclude-le."
+    )
+else:
+    st.success("Toate orele au date complete pe componente — nicio valoare completata artificial.")
+
 # ---------------------------------------------------------------------------
 # 1) Tabel orar
 # ---------------------------------------------------------------------------
 st.subheader(f"① Orar ({unit})")
-hourly = (df[COLS] / k).round(2 if unit == "GW" else 0)
+hourly = (df[COLS] / k).round(nd).fillna(0)
+hourly.insert(0, "Gap", df["_gaps"].map({0: "", 1: "⚠"}))
 hourly.index = hourly.index.strftime("%Y-%m-%d %H:%M")
 hourly.index.name = "Ora (CET)"
 st.dataframe(hourly, use_container_width=True, height=420)
@@ -149,7 +179,7 @@ st.dataframe(hourly, use_container_width=True, height=420)
 # ---------------------------------------------------------------------------
 st.subheader(f"② Media zilei ({unit})")
 g = df.groupby(df.index.date)
-daily = (g[COLS].mean() / k)
+daily = g[COLS].mean() / k
 daily["RL min"] = g["RL"].min() / k
 daily["RL max"] = g["RL"].max() / k
 daily["Ore RL<0"] = g["RL"].apply(lambda s: int((s < 0).sum()))
@@ -158,19 +188,21 @@ daily["Ore RL<0"] = g["RL"].apply(lambda s: int((s < 0).sum()))
 pk = df[df.index.hour.isin(range(8, 20))]
 daily["RL peak"] = pk.groupby(pk.index.date)["RL"].mean() / k
 
-daily = daily.round(2 if unit == "GW" else 0)
+daily["Ore lipsa"] = g["_gaps"].sum().astype(int)
+
+daily = daily.round(nd).fillna(0)
 daily.index.name = "Zi"
 st.dataframe(daily, use_container_width=True)
 
 st.caption(
     "`Ore RL<0` si `RL min` conteaza mai mult decat media: pe august, mutarea de la "
     "3-5 ore ieftine la 0 a urcat media zilnica de pret cu ~40 EUR/MWh. Media singura "
-    "ascunde exact pragul asta."
+    "ascunde exact pragul asta. `Ore lipsa` = ore completate cu 0, nu masurate."
 )
 
 st.download_button(
     "Descarca CSV (orar)",
-    df[COLS].reset_index().to_csv(index=False).encode(),
+    df[COLS + ["_gaps"]].reset_index().to_csv(index=False).encode(),
     file_name=f"de_lu_rl_{start:%Y%m%d}_{end:%Y%m%d}.csv",
     mime="text/csv",
 )
