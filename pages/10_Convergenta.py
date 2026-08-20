@@ -1,15 +1,18 @@
-# pages/10_Convergenta.py — Tabel preturi DA (DE-LU + toti vecinii), sfert cu sfert,
-# plus % convergenta cu DE-LU pe fiecare sfert.
+# pages/10_Convergenta.py — Preturi DA (DE-LU + vecini) + convergenta pe sfert de ora.
+#
+# ① Tabel de preturi, sfert cu sfert, cu sferturile cuplate marcate.
+# ② Matrice: pentru fiecare slot din zi (00:00 ... 23:45) si fiecare vecin,
+#    in cate % din zile a avut acelasi pret ca DE-LU.
+# ③ Detaliu pe fiecare tara in parte.
 #
 # Convergenta pe un sfert = |pret_vecin - pret_DE| <= prag.
-# Coloana "% conv" din tabelul de jos = din cate sferturi are vecinul acelasi pret ca DE.
-# Selector sus: ultima zi / 7 zile / etc.
 
 import io
 import zipfile
 import datetime as dt
 import xml.etree.ElementTree as ET
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -105,6 +108,17 @@ def get_price(eic, s_utc, e_utc):
     return s.tz_convert(TZ) if len(s) else s
 
 
+def heat(v, lo=0.0, hi=100.0):
+    """Verde proportional cu valoarea. Scris de mana ca sa nu ceara matplotlib."""
+    if pd.isna(v):
+        return "color:#bbb"
+    t = min(max((v - lo) / (hi - lo), 0.0), 1.0)
+    r = int(255 - 75 * t)
+    g = int(255 - 15 * t)
+    b = int(255 - 80 * t)
+    return f"background-color: rgb({r},{g},{b})"
+
+
 # ---------------------------------------------------------------------------
 # Selector perioada
 # ---------------------------------------------------------------------------
@@ -118,6 +132,7 @@ PERIODS = {
     "7 zile": (7, 1),
     "14 zile": (14, 1),
     "30 zile": (30, 1),
+    "90 zile": (90, 1),
 }
 period = c1.selectbox("Perioada", list(PERIODS.keys()), index=4)
 res_label = c2.radio("Rezolutie", ["Sfert", "Oră"], horizontal=True)
@@ -154,19 +169,24 @@ if "DE-LU" not in px.columns or px["DE-LU"].notna().sum() < 4:
     st.error("Lipsesc preturile DE-LU. Verifica ENTSOE_TOKEN si perioada.")
     st.stop()
 
-# DE-LU prima coloana, restul alfabetic
 cols = ["DE-LU"] + sorted([c for c in px.columns if c != "DE-LU"])
 px = px[cols]
 de = px["DE-LU"]
+neigh = [z for z in px.columns if z != "DE-LU"]
+
+# Slot in zi: "00:00", "00:15", ... "23:45"
+px_slot = px.index.strftime("%H:%M")
+n_days = px.index.normalize().nunique()
+unit = "sferturi" if res == "15min" else "ore"
 
 st.caption(
-    f"{len(px)} {'sferturi' if res == '15min' else 'ore'}, "
+    f"{len(px)} {unit} pe {n_days} zile, "
     f"{px.index.min():%Y-%m-%d %H:%M} → {px.index.max():%Y-%m-%d %H:%M} (CET). "
     "Convergenta = |pret vecin − pret DE-LU| ≤ prag."
 )
 
 # ---------------------------------------------------------------------------
-# 1) Tabelul de preturi, cu convergenta marcata
+# ① Tabel de preturi
 # ---------------------------------------------------------------------------
 st.subheader(f"① Preturi DA — {res_label.lower()} cu {res_label.lower()} (EUR/MWh)")
 
@@ -176,7 +196,6 @@ show.index.name = "CET"
 
 
 def _mark(col):
-    """Verde = cuplat cu DE pe acel sfert."""
     if col.name == "DE-LU":
         return ["background-color: #e8eef7; font-weight: 600"] * len(col)
     d = (px[col.name] - de).abs()
@@ -185,28 +204,59 @@ def _mark(col):
 
 
 st.dataframe(show.style.apply(_mark, axis=0).format("{:.2f}", na_rep="—"),
-             use_container_width=True, height=460)
+             use_container_width=True, height=440)
 
 # ---------------------------------------------------------------------------
-# 2) % convergenta pe fiecare zona
+# ② Matrice: % convergenta pe fiecare slot din zi x fiecare vecin
 # ---------------------------------------------------------------------------
-st.subheader("② Convergenta cu DE-LU")
+st.subheader(f"② % convergenta pe {'sfert' if res == '15min' else 'ora'} × zona")
 
-rows = []
-unit = "sferturi" if res == "15min" else "ore"
-for z in px.columns:
-    if z == "DE-LU":
-        continue
+conv = pd.DataFrame(
+    {z: ((px[z] - de).abs() <= tol) & px[z].notna() & de.notna() for z in neigh},
+    index=px.index,
+)
+valid = pd.DataFrame({z: px[z].notna() & de.notna() for z in neigh}, index=px.index)
+
+num = conv.groupby(px_slot).sum()
+den = valid.groupby(px_slot).sum()
+matrix = (100 * num / den.replace(0, np.nan)).round(1)
+matrix.index.name = "Slot CET"
+
+st.dataframe(
+    matrix.style.map(heat).format("{:.0f}%", na_rep="—"),
+    use_container_width=True,
+    height=min(700, 40 + 26 * len(matrix)),
+)
+
+if n_days == 1:
+    st.info(
+        "O singura zi in perioada → fiecare slot are un singur punct, deci "
+        "valorile sunt doar 0% sau 100%. Alege 7+ zile ca procentele sa insemne ceva."
+    )
+
+st.caption(
+    "Coloanele reci pe randurile de dimineata (05:00–08:00) si de seara (18:00–21:00) "
+    "sunt tipice: cuplarea se rupe la rampe, adica exact in orele care decid media zilei. "
+    "O convergenta globala de 70% poate insemna 95% noaptea si 30% la ora 19."
+)
+
+# ---------------------------------------------------------------------------
+# ③ Detaliu pe fiecare tara
+# ---------------------------------------------------------------------------
+st.subheader("③ Detaliu pe zona")
+
+summary = []
+for z in neigh:
     both = px[[z]].join(de.rename("DE")).dropna()
     if both.empty:
         continue
     d = both[z] - both["DE"]
-    conv = d.abs() <= tol
-    rows.append({
+    c = d.abs() <= tol
+    summary.append({
         "Zona": z,
         f"n {unit}": len(both),
-        f"{unit.capitalize()} cuplate": int(conv.sum()),
-        "% conv": 100 * conv.mean(),
+        "Cuplate": int(c.sum()),
+        "% conv": 100 * c.mean(),
         "Spread mediu": d.mean(),
         "Spread |mediu|": d.abs().mean(),
         "% vecin mai scump": 100 * (d > tol).mean(),
@@ -214,26 +264,40 @@ for z in px.columns:
         "Spread max": d.max(),
     })
 
-tab = pd.DataFrame(rows).sort_values("% conv", ascending=False).set_index("Zona")
+summ = pd.DataFrame(summary).sort_values("% conv", ascending=False).set_index("Zona")
 st.dataframe(
-    tab.round(2), use_container_width=True,
+    summ.round(2), use_container_width=True,
     column_config={"% conv": st.column_config.ProgressColumn(
         "% conv", min_value=0, max_value=100, format="%.1f%%")},
 )
 
 st.caption(
     "`Spread mediu` are semn: pozitiv = vecinul e in medie mai scump ca DE-LU. "
-    "Cuplarea e adesea asimetrica — o zona poate fi cuplata 70% din timp si totusi "
-    "sistematic mai scumpa in restul. Procentul singur ascunde asta, semnul nu."
+    "Cuplarea e asimetrica — o zona poate fi cuplata 70% din timp si totusi sistematic "
+    "mai scumpa in rest. Procentul singur ascunde asta, semnul nu."
 )
 
-# ---------------------------------------------------------------------------
-# 3) Media zilei
-# ---------------------------------------------------------------------------
-if px.index.normalize().nunique() > 1:
-    st.subheader("③ Media zilei (base) — EUR/MWh")
-    st.dataframe(px.groupby(px.index.date).mean().round(2),
-                 use_container_width=True)
+for z in summ.index:
+    both = px[[z]].join(de.rename("DE")).dropna()
+    d = both[z] - both["DE"]
+    with st.expander(f"{z} — {summ.loc[z, '% conv']:.1f}% cuplat, "
+                     f"spread mediu {summ.loc[z, 'Spread mediu']:+.2f} EUR/MWh"):
+        slot = both.index.strftime("%H:%M")
+        det = pd.DataFrame({
+            f"n {unit}": d.groupby(slot).size(),
+            "Cuplate": (d.abs() <= tol).groupby(slot).sum().astype(int),
+            "% conv": 100 * (d.abs() <= tol).groupby(slot).mean(),
+            "Spread mediu": d.groupby(slot).mean(),
+            "Spread min": d.groupby(slot).min(),
+            "Spread max": d.groupby(slot).max(),
+        })
+        det.index.name = "Slot CET"
+        st.dataframe(
+            det.round(2), use_container_width=True,
+            height=min(600, 40 + 26 * len(det)),
+            column_config={"% conv": st.column_config.ProgressColumn(
+                "% conv", min_value=0, max_value=100, format="%.0f%%")},
+        )
 
 st.download_button(
     "Descarca preturile (CSV)",
