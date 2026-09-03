@@ -3,6 +3,12 @@
 # CE FACE: alegi setul de date, zonele si anii, apesi, primesti un CSV lat cu o
 # coloana per serie. Nu salveaza nimic. Analiza se face in alta parte.
 #
+# FUS ORAR: ENTSO-E interpreteaza periodStart si periodEnd in UTC, iar granitele
+# de an pe care le vrei sunt LOCALE (CET/CEST). Daca trimiti 202101010000, primesti
+# de la 01:00 CET, nu de la 00:00 — lipseste prima ora a anului. Codul converteste
+# explicit granita locala in UTC inainte de a formata parametrul. Ieșirea e tot in
+# ora locala CET/CEST, cu DST tratat.
+#
 # LIMITELE DE INTERVAL DIFERA PER DOCUMENT, si nu sunt documentate uniform.
 # Preturile (A44) accepta un an per cerere. Prognoza de load (A65/A01) accepta
 # maxim O LUNA — de asta GUI-ul sparge in fisiere lunare, nu din alegere de
@@ -99,8 +105,17 @@ BORDERS = {
 
 
 # --------------------------------------------------------------------------- #
-# Interval chunking
+# Time boundaries
 # --------------------------------------------------------------------------- #
+def to_utc_param(d: date) -> str:
+    """Local midnight on `d` (CET/CEST) expressed as the UTC stamp ENTSO-E wants.
+
+    Sending 20210101 0000 gets you 01:00 CET, not 00:00 — the first hour of the
+    year goes missing. The boundary has to be localised first, then converted.
+    """
+    return (pd.Timestamp(d, tz=TZ).tz_convert("UTC")).strftime("%Y%m%d%H%M")
+
+
 def parse_max_period(msg: str) -> str | None:
     """ENTSO-E states the allowed period in the error text. Read it."""
     m = re.search(r"maximum allowed period '(P\d+[YMD])'", msg or "")
@@ -129,8 +144,8 @@ def chunk_dates(start: date, end: date, period: str) -> list[tuple[date, date]]:
 
 
 def year_span(year: int) -> tuple[date, date]:
-    """Whole year, or year-to-date for the current one. Asking beyond today
-    returns a 400, so the current year must stop at today."""
+    """Whole local year, or year-to-date for the current one. Asking beyond
+    today returns a 400, so the current year must stop at today."""
     today = date.today()
     if year > today.year:
         raise RuntimeError(f"{year} e in viitor")
@@ -250,8 +265,8 @@ class MaxPeriod(Exception):
 def one_request(dsk: str, target, d0: date, d1: date, token: str) -> pd.DataFrame:
     _, doc, proc, style, vtag, _, _, _ = DATASETS[dsk]
     p = {"securityToken": token, "documentType": doc,
-         "periodStart": d0.strftime("%Y%m%d") + "0000",
-         "periodEnd": d1.strftime("%Y%m%d") + "0000"}
+         "periodStart": to_utc_param(d0),
+         "periodEnd": to_utc_param(d1)}
     if proc:
         p["processType"] = proc
     if style == "in_out":
@@ -346,6 +361,15 @@ def to_series(df: pd.DataFrame, out_res: str) -> pd.Series:
     return s.resample(out_res).mean()
 
 
+def slug(names: list[str], limit: int = 4) -> str:
+    """Zone tag for the filename. Long selections collapse to a count so the
+    name stays usable."""
+    clean = [n.replace("-", "").replace(">", "-") for n in names]
+    if len(clean) <= limit:
+        return "_".join(clean)
+    return f"{clean[0]}_plus{len(clean) - 1}"
+
+
 # --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
@@ -387,10 +411,11 @@ n_req = len(targets) * len(years) * per_year
 st.caption(f"{len(targets)} ținte x {len(years)} ani x {per_year} chunk-uri de "
            f"{start_period} = **~{n_req} cereri**, ~{max(1, round(n_req * MIN_GAP / 60))} minute. "
            "Limita de interval se ajusteaza automat daca ENTSO-E o refuza. "
+           "Granitele se trimit convertite in UTC; ieșirea e in ora locala CET/CEST. "
            "Nu se salveaza nimic — la final apesi download.")
 
 if st.button("Descarca", type="primary", disabled=not targets):
-    for k in ("dl", "dl_notes", "dl_label"):
+    for k in ("dl", "dl_notes", "dl_label", "dl_zones"):
         st.session_state.pop(k, None)          # clear stale results before a new run
     bar, box, notes, cols = st.progress(0.0), st.empty(), [], {}
     learned: dict[str, str] = {}
@@ -446,11 +471,13 @@ if st.button("Descarca", type="primary", disabled=not targets):
         st.session_state["dl"] = wide
         st.session_state["dl_notes"] = notes
         st.session_state["dl_label"] = dsk
+        st.session_state["dl_zones"] = slug(
+            [t if isinstance(t, str) else f"{t[0]}>{t[1]}" for t in targets])
 
 wide = st.session_state.get("dl")
 if wide is not None:
     st.success(f"{len(wide):,} randuri x {len(wide.columns)} serii  |  "
-               f"{wide.index.min():%Y-%m-%d} - {wide.index.max():%Y-%m-%d}")
+               f"{wide.index.min():%Y-%m-%d %H:%M} - {wide.index.max():%Y-%m-%d %H:%M}")
     comp = (100 * wide.notna().mean()).round(1).sort_values()
     thin = comp[comp < 95]
     if len(thin):
@@ -459,10 +486,11 @@ if wide is not None:
                    ". O medie lunara pe date incomplete arata normala si e parțiala.")
     for nt in st.session_state.get("dl_notes", []):
         st.caption(nt)
-    st.download_button(
-        "CSV", wide.round(2).to_csv().encode(),
-        f"{st.session_state.get('dl_label','entsoe')}_{wide.index.min():%Y%m%d}_"
-        f"{wide.index.max():%Y%m%d}_{out_res}.csv", "text/csv", type="primary")
-    st.caption("Format lat, ora locala CET/CEST cu DST tratat. Preturile sunt EUR/MWh; "
-               "load si generare sunt MW — la agregare, energia e MW mediu x orele "
-               "perioadei, nu suma valorilor.")
+    fname = (f"{st.session_state.get('dl_label','entsoe')}"
+             f"_{st.session_state.get('dl_zones','zone')}"
+             f"_{wide.index.min():%Y%m%d}_{wide.index.max():%Y%m%d}_{out_res}.csv")
+    st.download_button("CSV", wide.round(2).to_csv().encode(),
+                       fname, "text/csv", type="primary")
+    st.caption(f"Fisier: `{fname}` · format lat, ora locala CET/CEST cu DST tratat. "
+               "Preturile sunt EUR/MWh; load si generare sunt MW — la agregare, energia "
+               "e MW mediu x orele perioadei, nu suma valorilor.")
