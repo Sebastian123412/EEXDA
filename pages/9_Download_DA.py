@@ -1,4 +1,4 @@
-# pages/9_Download_ENTSOE.py — Descarcator generic ENTSO-E, multi-zona, multi-an.
+# pages/9_Download_DA.py — Descarcator generic ENTSO-E, multi-zona, multi-an.
 #
 # CE FACE: alegi setul de date, zonele si anii, apesi, primesti un CSV lat cu o
 # coloana per serie. Nu salveaza nimic. Analiza se face in alta parte.
@@ -9,9 +9,9 @@
 # LIMITA: 60 de cereri in 60 de secunde, altfel IP banat pana la 10 minute.
 #
 # ERORI: ENTSO-E raspunde 400 atat pentru parametri greșiți cat si pentru lipsa
-# de date, si pune motivul REAL in corpul raspunsului. Codul il extrage si il
-# afiseaza. Fara asta nu poti distinge o limita de interval de un entitlement
-# lipsa, si sunt remedii complet diferite.
+# de date, si pune motivul REAL in corpul raspunsului. reason_text() il extrage
+# si il afiseaza. Fara asta nu poti distinge o limita de interval de un
+# entitlement lipsa, si sunt remedii complet diferite.
 #
 # INTERVALE: periodEnd se opreste la 12-31 23:00, nu la 01-01 al anului urmator.
 # A65 are restrictie de un an per interval si granita exacta o declanseaza. Iar
@@ -21,8 +21,12 @@
 #   * curveType A03 — pozitiile vin rare si valoarea tine pana la urmatoarea.
 #     Fara reindexare + ffill pierzi ore intregi, in tacere.
 #   * mai multe TimeSeries pe acelasi interval (Sequence 1/2 din GUI). Se
-#     pastreaza prima; la preturi e seria SDAC cuplata.
-#   * rezolutii mixte: orar pana in 2025, sferturi dupa. Iesirea orara mediaza.
+#     pastreaza prima; la preturi e seria SDAC cuplata, cea care reproduce
+#     decontarea EEX la cent.
+#   * rezolutii mixte: orar pana in 2025, sferturi dupa. In to_series(), `fine`
+#     e inca DataFrame, deci fine.index e un Index simplu fara .floor() — orele
+#     trebuie comparate cu COLOANA ts_utc. Bug-ul se declanseaza doar cand un
+#     singur chunk are si PT60M si PT15M, adica exact tranzitia din 2025.
 #   * A75: seriile cu outBiddingZone_Domain sunt CONSUM (pompaj), nu producție.
 #     Amestecate, subestimeaza flota de pompaj si umfla generarea.
 #
@@ -69,7 +73,7 @@ DEFAULT = ["DE-LU"]
 PSR = {
     "B01": "biomass",   "B02": "lignite",    "B03": "coalgas",  "B04": "gas",
     "B05": "hardcoal",  "B06": "oil",        "B07": "oilshale", "B08": "peat",
-    "B09": "geo",        "B10": "hydro_pump", "B11": "hydro_ror", "B12": "hydro_res",
+    "B09": "geo",       "B10": "hydro_pump", "B11": "hydro_ror", "B12": "hydro_res",
     "B13": "marine",    "B14": "nuclear",    "B15": "other_res", "B16": "solar",
     "B17": "waste",     "B18": "wind_off",   "B19": "wind_on",  "B20": "other",
     "B25": "storage",
@@ -77,12 +81,12 @@ PSR = {
 
 # key: (label, documentType, processType, domain style, value tag, split, psr filter)
 DATASETS = {
-    "prices":    ("Day-ahead prices (A44)",             "A44", "A01", "in_out", "price.amount", False, None),
-    "load_act":  ("Actual total load (A65/A16)",         "A65", "A16", "out_bz", "quantity",     False, None),
-    "load_fc":   ("Day-ahead load forecast (A65/A01)",   "A65", "A01", "out_bz", "quantity",     False, None),
-    "ws_fc":     ("Wind & solar forecast (A69/A01)",     "A69", "A01", "in_dom", "quantity",     True,  ["B16", "B18", "B19"]),
-    "gen_act":   ("Actual generation per type (A75/A16)", "A75", "A16", "in_dom", "quantity",    True,  None),
-    "flows":     ("Physical cross-border flows (A11)",   "A11", None,  "pair",   "quantity",     False, None),
+    "prices":   ("Day-ahead prices (A44)",              "A44", "A01", "in_out", "price.amount", False, None),
+    "load_act": ("Actual total load (A65/A16)",          "A65", "A16", "out_bz", "quantity",     False, None),
+    "load_fc":  ("Day-ahead load forecast (A65/A01)",    "A65", "A01", "out_bz", "quantity",     False, None),
+    "ws_fc":    ("Wind & solar forecast (A69/A01)",      "A69", "A01", "in_dom", "quantity",     True,  ["B16", "B18", "B19"]),
+    "gen_act":  ("Actual generation per type (A75/A16)",  "A75", "A16", "in_dom", "quantity",    True,  None),
+    "flows":    ("Physical cross-border flows (A11)",    "A11", None,  "pair",   "quantity",     False, None),
 }
 
 BORDERS = {
@@ -118,7 +122,7 @@ def reason_text(xml_text: str) -> str:
 def parse_doc(xml_text: str, value_tag: str) -> pd.DataFrame:
     """MarketDocument -> [ts_utc, value, resolution, seq, psr, flow].
 
-    numpy timestamp arithmetic and one concat at the end. ENTSO-E returns one
+    numpy timestamp arithmetic with one concat at the end. ENTSO-E returns one
     TimeSeries per day, so a year of generation across 18 production types is
     ~6,500 TimeSeries in a single document — a DataFrame per Period is ~10x
     slower, measured.
@@ -258,6 +262,14 @@ def fetch(dsk: str, target, year: int, token: str) -> pd.DataFrame:
 
 
 def to_series(df: pd.DataFrame, out_res: str) -> pd.Series:
+    """Collapse a mixed-resolution chunk into one series at out_res.
+
+    Prefer PT15M where it exists, fall back to hourly for the hours it does not
+    cover. `fine` is still a DataFrame here, so `fine.index` is a plain Index
+    with no .floor() — the hourly rows must be compared against the ts_utc
+    COLUMN. This only bites when one chunk holds both PT60M and PT15M rows,
+    which is exactly the 2025 resolution transition.
+    """
     d = (df.sort_values(["ts_utc", "resolution", "seq"])
            .drop_duplicates(["ts_utc", "resolution"], keep="first"))
     fine = d[d["resolution"] == "PT15M"]
@@ -268,8 +280,11 @@ def to_series(df: pd.DataFrame, out_res: str) -> pd.Series:
     if not hour.empty:
         h = hour.set_index("ts_utc")["value"]
         if not fine.empty:
-            h = h[~h.index.floor("h").isin(fine.index.floor("h").unique())]
+            fine_hours = fine["ts_utc"].dt.floor("h").unique()
+            h = h[~h.index.floor("h").isin(fine_hours)]
         parts.append(h)
+    if not parts:
+        return pd.Series(dtype=float)
     s = pd.concat(parts).sort_index()
     s = s[~s.index.duplicated(keep="first")]
     return s.resample(out_res).mean()
@@ -346,9 +361,13 @@ if st.button("Descarca", type="primary", disabled=not targets):
                 suffix = PSR.get(psr, psr or "na")
                 if fl == "cons":
                     suffix += "_cons"      # pumped-storage consumption, not generation
-                cols[f"{name}_{suffix}"] = to_series(g, out_res)
+                s = to_series(g, out_res)
+                if not s.empty:
+                    cols[f"{name}_{suffix}"] = s
         else:
-            cols[name] = to_series(allc, out_res)
+            s = to_series(allc, out_res)
+            if not s.empty:
+                cols[name] = s
 
     if not cols:
         st.error("Nu am obtinut nimic. Mesajele de mai sus sunt exact ce a raspuns "
