@@ -3,20 +3,22 @@
 # CE FACE: alegi setul de date, zonele si anii, apesi, primesti un CSV lat cu o
 # coloana per serie. Nu salveaza nimic. Analiza se face in alta parte.
 #
+# VITEZA: secvential era bottleneck-ul, nu limita de rata. 69 de chunk-uri lunare
+# la 3-8 s fiecare = 5-10 minute per zona, in timp ce API-ul permite 60 de cereri
+# pe minut si secvential abia atingi 15-20. Sase fire in spatele unui pacer GLOBAL
+# merg ~5x mai repede si stau la o treime din plafon. Un sleep per fir NU limiteaza
+# rata totala — doar un ceas partajat o face.
+#
 # FUS ORAR: ENTSO-E interpreteaza periodStart si periodEnd in UTC, iar granitele
 # de an pe care le vrei sunt LOCALE (CET/CEST). Daca trimiti 202101010000, primesti
 # de la 01:00 CET, nu de la 00:00 — lipseste prima ora a anului. Codul converteste
-# explicit granita locala in UTC inainte de a formata parametrul. Ieșirea e tot in
-# ora locala CET/CEST, cu DST tratat.
+# explicit granita locala in UTC. Ieșirea e tot in ora locala, cu DST tratat.
 #
 # LIMITELE DE INTERVAL DIFERA PER DOCUMENT, si nu sunt documentate uniform.
 # Preturile (A44) accepta un an per cerere. Prognoza de load (A65/A01) accepta
 # maxim O LUNA — de asta GUI-ul sparge in fisiere lunare, nu din alegere de
-# interfata. In loc sa ghicesc fiecare limita, codul o CITESTE din mesajul de
-# eroare ("maximum allowed period 'P1M'"), reimparte automat si retine limita
-# per set de date, ca sa n-o mai descopere la fiecare zona.
-#
-# LIMITA DE RATA: 60 de cereri in 60 de secunde, altfel IP banat pana la 10 min.
+# interfata. In loc sa ghicesc, codul CITESTE limita din mesajul de eroare
+# ("maximum allowed period 'P1M'"), reimparte automat si o retine per set.
 #
 # ERORI: ENTSO-E raspunde 400 atat pentru parametri greșiți cat si pentru lipsa
 # de date, si pune motivul REAL in corpul raspunsului. reason_text() il extrage.
@@ -38,7 +40,9 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from xml.etree import ElementTree as ET
 
@@ -51,7 +55,8 @@ st.set_page_config(page_title="Download ENTSO-E", layout="wide")
 
 API = "https://web-api.tp.entsoe.eu/api"
 TZ = "Europe/Berlin"
-MIN_GAP = 1.2
+WORKERS = 6
+RATE_PER_MIN = 50            # ceiling is 60/60s; margin keeps the IP unbanned
 MAX_RETRIES = 4
 STEP_NS = {"PT15M": 900_000_000_000, "PT30M": 1_800_000_000_000,
            "PT60M": 3_600_000_000_000, "PT1H": 3_600_000_000_000,
@@ -105,15 +110,43 @@ BORDERS = {
 
 
 # --------------------------------------------------------------------------- #
+# Rate pacing
+# --------------------------------------------------------------------------- #
+class Pacer:
+    """Global request pacer shared by every worker thread.
+
+    A per-thread sleep does not bound the total rate — six threads each waiting
+    1.2 s still fire five times faster than intended. Only a shared clock does.
+    """
+
+    def __init__(self, per_min: int = RATE_PER_MIN):
+        self.iv = 60.0 / per_min
+        self.lock = threading.Lock()
+        self.next_at = 0.0
+
+    def wait(self) -> None:
+        with self.lock:
+            now = time.monotonic()
+            t = max(now, self.next_at)
+            self.next_at = t + self.iv
+        d = t - time.monotonic()
+        if d > 0:
+            time.sleep(d)
+
+
+PACER = Pacer()
+
+
+# --------------------------------------------------------------------------- #
 # Time boundaries
 # --------------------------------------------------------------------------- #
 def to_utc_param(d: date) -> str:
-    """Local midnight on `d` (CET/CEST) expressed as the UTC stamp ENTSO-E wants.
+    """Local midnight on `d` (CET/CEST) as the UTC stamp ENTSO-E expects.
 
     Sending 20210101 0000 gets you 01:00 CET, not 00:00 — the first hour of the
     year goes missing. The boundary has to be localised first, then converted.
     """
-    return (pd.Timestamp(d, tz=TZ).tz_convert("UTC")).strftime("%Y%m%d%H%M")
+    return pd.Timestamp(d, tz=TZ).tz_convert("UTC").strftime("%Y%m%d%H%M")
 
 
 def parse_max_period(msg: str) -> str | None:
@@ -149,8 +182,7 @@ def year_span(year: int) -> tuple[date, date]:
     today = date.today()
     if year > today.year:
         raise RuntimeError(f"{year} e in viitor")
-    start = date(year, 1, 1)
-    return start, (today if year == today.year else date(year + 1, 1, 1))
+    return date(year, 1, 1), (today if year == today.year else date(year + 1, 1, 1))
 
 
 # --------------------------------------------------------------------------- #
@@ -255,18 +287,15 @@ def parse_doc(xml_text: str, value_tag: str) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Fetch
 # --------------------------------------------------------------------------- #
-_last = [0.0]
-
-
 class MaxPeriod(Exception):
-    def __init__(self, period): self.period = period
+    def __init__(self, period):
+        self.period = period
 
 
 def one_request(dsk: str, target, d0: date, d1: date, token: str) -> pd.DataFrame:
     _, doc, proc, style, vtag, _, _, _ = DATASETS[dsk]
     p = {"securityToken": token, "documentType": doc,
-         "periodStart": to_utc_param(d0),
-         "periodEnd": to_utc_param(d1)}
+         "periodStart": to_utc_param(d0), "periodEnd": to_utc_param(d1)}
     if proc:
         p["processType"] = proc
     if style == "in_out":
@@ -281,10 +310,7 @@ def one_request(dsk: str, target, d0: date, d1: date, token: str) -> pd.DataFram
 
     err = None
     for attempt in range(MAX_RETRIES):
-        gap = time.monotonic() - _last[0]
-        if gap < MIN_GAP:
-            time.sleep(MIN_GAP - gap)
-        _last[0] = time.monotonic()
+        PACER.wait()
         try:
             r = requests.get(API, params=p, timeout=240)
             if r.status_code == 429 or 500 <= r.status_code < 600:
@@ -307,32 +333,39 @@ def one_request(dsk: str, target, d0: date, d1: date, token: str) -> pd.DataFram
 
 def fetch_span(dsk: str, target, d0: date, d1: date, token: str,
                learned: dict, note) -> list[pd.DataFrame]:
-    """Fetch [d0, d1) in whatever chunk size the endpoint accepts.
+    """Fetch [d0, d1) in parallel, in whatever chunk size the endpoint accepts.
 
-    Starts at the dataset's declared period, shrinks whenever ENTSO-E says the
-    interval is too large, and remembers the limit so the next zone-year does
-    not rediscover it.
+    If ENTSO-E rejects the interval, the stated limit is read from the error,
+    the whole span is re-chunked, and the limit is remembered so the next
+    zone-year does not rediscover it.
     """
     period = learned.get(dsk) or DATASETS[dsk][7]
-    out = []
     while True:
         chunks = chunk_dates(d0, d1, period)
-        try:
-            for c0, c1 in chunks:
-                df = one_request(dsk, target, c0, c1, token)
-                if not df.empty:
-                    out.append(df)
+        out, shrink = [], None
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futs = {ex.submit(one_request, dsk, target, c0, c1, token): (c0, c1)
+                    for c0, c1 in chunks}
+            for f in as_completed(futs):
+                try:
+                    df = f.result()
+                    if not df.empty:
+                        out.append(df)
+                except MaxPeriod as mp:
+                    shrink = mp.period
+                except RuntimeError as exc:
+                    c0, c1 = futs[f]
+                    note(f"{c0}..{c1}: {str(exc)[:140]}")
+        if shrink is None:
             return out
-        except MaxPeriod as mp:
-            new = mp.period if mp.period in PERIOD_ORDER else next_smaller(period)
-            if new is None or new == period:
-                new = next_smaller(period)
-            if new is None:
-                raise RuntimeError(f"nu pot micsora sub {period}")
-            note(f"limita de interval: {period} → {new} pentru {DATASETS[dsk][0]}")
-            learned[dsk] = new
-            period = new
-            out = []
+        new = shrink if shrink in PERIOD_ORDER else next_smaller(period)
+        if new is None or new == period:
+            new = next_smaller(period)
+        if new is None:
+            raise RuntimeError(f"nu pot micsora sub {period}")
+        note(f"limita de interval: {period} → {new} pentru {DATASETS[dsk][0]}")
+        learned[dsk] = new
+        period = new
 
 
 def to_series(df: pd.DataFrame, out_res: str) -> pd.Series:
@@ -408,22 +441,27 @@ else:
 years = list(range(int(y0), int(y1) + 1))
 per_year = len(chunk_dates(date(2025, 1, 1), date(2026, 1, 1), start_period))
 n_req = len(targets) * len(years) * per_year
+lo_min = max(1, round(n_req * 60 / RATE_PER_MIN / 60))
+hi_min = max(2, round(n_req * 8 / WORKERS / 60))
 st.caption(f"{len(targets)} ținte x {len(years)} ani x {per_year} chunk-uri de "
-           f"{start_period} = **~{n_req} cereri**, ~{max(1, round(n_req * MIN_GAP / 60))} minute. "
-           "Limita de interval se ajusteaza automat daca ENTSO-E o refuza. "
-           "Granitele se trimit convertite in UTC; ieșirea e in ora locala CET/CEST. "
-           "Nu se salveaza nimic — la final apesi download.")
+           f"{start_period} = **~{n_req} cereri** pe {WORKERS} fire, "
+           f"~{lo_min}-{hi_min} minute. Limita ENTSO-E e 60 cereri / 60s; "
+           f"pacer-ul global tine {RATE_PER_MIN}. Granitele se trimit convertite in "
+           "UTC; ieșirea e in ora locala CET/CEST. Nu se salveaza nimic.")
 
 if st.button("Descarca", type="primary", disabled=not targets):
     for k in ("dl", "dl_notes", "dl_label", "dl_zones"):
         st.session_state.pop(k, None)          # clear stale results before a new run
     bar, box, notes, cols = st.progress(0.0), st.empty(), [], {}
     learned: dict[str, str] = {}
+    lock = threading.Lock()
 
     def note(msg: str) -> None:
-        notes.append(msg)
-        box.markdown("  \n".join(notes[-12:]))
+        with lock:
+            notes.append(msg)
+            box.markdown("  \n".join(notes[-12:]))
 
+    t_start = time.monotonic()
     total = len(targets) * len(years)
     i = 0
     for tgt in targets:
@@ -431,7 +469,8 @@ if st.button("Descarca", type="primary", disabled=not targets):
         chunks = []
         for y in years:
             i += 1
-            bar.progress(i / total, text=f"{name} {y}  ({i}/{total})")
+            el = time.monotonic() - t_start
+            bar.progress(i / total, text=f"{name} {y}  ({i}/{total}) · {el:.0f}s")
             try:
                 d0, d1 = year_span(y)
                 got = fetch_span(dsk, tgt, d0, d1, token, learned, note)
@@ -469,7 +508,8 @@ if st.button("Descarca", type="primary", disabled=not targets):
         wide.index = wide.index.tz_convert(TZ)
         wide.index.name = "timestamp_local"
         st.session_state["dl"] = wide
-        st.session_state["dl_notes"] = notes
+        st.session_state["dl_notes"] = notes + [
+            f"descarcat in {time.monotonic() - t_start:.0f}s pe {WORKERS} fire"]
         st.session_state["dl_label"] = dsk
         st.session_state["dl_zones"] = slug(
             [t if isinstance(t, str) else f"{t[0]}>{t[1]}" for t in targets])
